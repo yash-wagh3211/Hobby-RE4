@@ -1,0 +1,23 @@
+1."distilbert-base-uncased-finetuned-sst-2-english"-given by claude
+
+2."Star Rating" Model (Top Recommendation)
+Model Name: nlptown/bert-base-multilingual-uncased-sentiment (Available on Hugging Face)
+
+Most sentiment models only output "Positive" or "Negative." For a Business Analyst dashboard, that isn't always enough detail.
+
+Why it is perfect for you: This specific model reads a text review and automatically predicts a 1 to 5 star rating.
+
+3.The "Slang & Sarcasm" Expert
+Model Name: cardiffnlp/twitter-roberta-base-sentiment-latest (Available on Hugging Face)
+
+This model was trained on millions of Twitter posts.
+
+Why it is perfect for you: The way people write Steam reviews is almost identical to how they write tweets—short, highly emotional, and packed with internet slang.
+
+4.The Fast Baseline (NLTK)
+Model Name: VADER (Valence Aware Dictionary and sEntiment Reasoner)
+
+If you don't want to download large AI models, VADER is the classic approach built directly into the NLTK library.
+
+Why it is useful: It requires zero internet connection to run and processes thousands of rows in milliseconds.
+

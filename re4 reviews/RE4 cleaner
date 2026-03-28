@@ -1,0 +1,314 @@
+"""
+re4_reviews_cleaner.py
+──────────────────────────────────────────────────────────────────────────────
+Production-grade cleaning pipeline for Steam review data.
+Input : re4_reviews.csv  (columns: review_text, voted_up, playtime_forever)
+Output: re4_reviews_clean.csv  (cleaned, flagged, QA-stamped)
+
+Pipeline stages
+  1. Load & type-cast
+  2. Unicode normalisation + control-char removal
+  3. Text normalisation  (whitespace, boilerplate, symbols)
+  4. QA flags           (empty, too-short, symbol-only, non-English,
+                         zero-playtime, outlier length)
+  5. Deduplication
+  6. Filter to usable reviews  →  df_model
+  7. QA summary table
+  8. Diagnostic plots
+  9. Save
+
+Requirements
+  pip install pandas numpy matplotlib seaborn langdetect
+"""
+
+# ── Imports ───────────────────────────────────────────────────────────────────
+import re
+import unicodedata
+import warnings
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from langdetect import LangDetectException, detect
+
+warnings.filterwarnings("ignore")
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 0.  CONFIGURATION  (tweak here, nothing else needs to change)
+# ═════════════════════════════════════════════════════════════════════════════
+CFG = {
+    # Paths
+    "input_path":          "re4_reviews.csv",
+    "output_path":         "re4_reviews_clean.csv",
+
+    # Text quality thresholds
+    "min_char_len":        10,      # fewer chars → too short
+    "min_word_count":      3,       # fewer words  → too short
+    "max_char_len":        5_000,   # more chars   → flagged as outlier
+
+    # Playtime threshold (minutes)
+    "min_playtime":        0,       # 0 = keep zero-playtime but flag them
+
+    # Whether to DROP flagged rows or only mark them
+    "drop_non_english":    True,
+    "drop_zero_playtime":  False,   # flip to True for stricter cleaning
+    "drop_outlier_length": False,
+}
+
+# Steam-UI boilerplate that sometimes bleeds into the review_text field
+BOILERPLATE_PATTERN = re.compile(
+    r"^(early\s+access\s+review|recommended|not\s+recommended)[:\-\s]*",
+    flags=re.IGNORECASE,
+)
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 1.  HELPER FUNCTIONS
+# ═════════════════════════════════════════════════════════════════════════════
+
+def remove_control_chars(text: str) -> str:
+    """Remove invisible / non-printable unicode control characters."""
+    return "".join(
+        ch for ch in text
+        if not unicodedata.category(ch).startswith("C")
+    )
+
+
+def normalise_unicode(text: str) -> str:
+    """
+    NFKC normalisation:
+      - fullwidth chars  →  ASCII equivalents  (ｒｅｓｉｄｅｎｔ → resident)
+      - ligatures        →  base chars         (ﬁ → fi)
+      - composed accents →  canonical form
+    """
+    return unicodedata.normalize("NFKC", text)
+
+
+def clean_text(raw: str) -> str:
+    """
+    Full text-cleaning chain applied to a single review string.
+    Returns a normalised, stripped string (may be empty string).
+    """
+    if not isinstance(raw, str):
+        return ""
+
+    s = normalise_unicode(raw)
+    s = remove_control_chars(s)
+
+    # Explicit whitespace escapes that sometimes appear literally in Steam data
+    s = s.replace(r"\n", " ").replace(r"\t", " ").replace(r"\r", " ")
+
+    # Collapse all whitespace (tabs, newlines, multiple spaces)
+    s = re.sub(r"\s+", " ", s)
+
+    # Strip Steam-UI boilerplate prefix
+    s = BOILERPLATE_PATTERN.sub("", s)
+
+    return s.strip()
+
+
+def detect_language(text: str) -> str:
+    """Return ISO-639-1 language code, or 'unknown' on failure."""
+    try:
+        return detect(text)
+    except LangDetectException:
+        return "unknown"
+
+
+def is_symbol_only(text: str) -> bool:
+    """
+    True when the review contains no word characters at all
+    (e.g. '👍👍👍' or '!!!!!').
+    """
+    return bool(text) and not bool(re.search(r"\w", text))
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 2.  LOAD & TYPE-CAST
+# ═════════════════════════════════════════════════════════════════════════════
+
+print("── 1 / 7  Loading data ──────────────────────────────────────────────")
+
+df = pd.read_csv(CFG["input_path"])
+
+# Defensive: ensure expected columns exist
+required_cols = {"review_text", "voted_up", "playtime_forever"}
+missing = required_cols - set(df.columns)
+if missing:
+    raise ValueError(f"CSV is missing expected columns: {missing}")
+
+# Type enforcement
+df["review_text"]      = df["review_text"].astype(str).fillna("")
+df["voted_up"]         = df["voted_up"].astype(bool)
+df["playtime_forever"] = pd.to_numeric(df["playtime_forever"], errors="coerce").fillna(0).astype(int)
+
+rows_raw = len(df)
+print(f"   Loaded {rows_raw:,} rows from '{CFG['input_path']}'")
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 3.  TEXT NORMALISATION
+# ═════════════════════════════════════════════════════════════════════════════
+
+print("── 2 / 7  Cleaning text ─────────────────────────────────────────────")
+
+df["review_text_clean"] = df["review_text"].map(clean_text)
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 4.  QA FEATURE COLUMNS
+# ═════════════════════════════════════════════════════════════════════════════
+
+print("── 3 / 7  Computing QA flags ────────────────────────────────────────")
+
+df["char_len"]   = df["review_text_clean"].str.len()
+df["word_count"] = df["review_text_clean"].str.split().map(
+    lambda x: len(x) if x else 0
+)
+
+# Boolean flags — each is independent; they do NOT cascade
+df["is_empty"]         = df["review_text_clean"].eq("")
+df["is_too_short"]     = (
+    (df["char_len"]   < CFG["min_char_len"]) |
+    (df["word_count"] < CFG["min_word_count"])
+)
+df["is_symbol_only"]   = df["review_text_clean"].map(is_symbol_only)
+df["is_zero_playtime"] = df["playtime_forever"] == 0
+df["is_outlier_len"]   = df["char_len"] > CFG["max_char_len"]
+
+# Language detection (slow — ~1–2 ms per review)
+print("   Detecting languages (this may take ~10–30 s for 2 000 rows) …")
+df["lang"] = df["review_text_clean"].map(detect_language)
+df["is_non_english"] = ~df["lang"].isin(["en", "unknown"])
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 5.  DEDUPLICATION
+# ═════════════════════════════════════════════════════════════════════════════
+
+print("── 4 / 7  Deduplicating ─────────────────────────────────────────────")
+
+# Sort so the copy with the highest playtime is kept when text is identical
+df = df.sort_values("playtime_forever", ascending=False)
+df["is_duplicate"] = df.duplicated(subset=["review_text_clean"], keep="first")
+
+rows_dup = df["is_duplicate"].sum()
+print(f"   Duplicate rows flagged: {rows_dup:,}")
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 6.  APPLY FILTERS  →  df_model
+# ═════════════════════════════════════════════════════════════════════════════
+
+print("── 5 / 7  Filtering ─────────────────────────────────────────────────")
+
+# Always-drop conditions
+hard_mask = (
+    ~df["is_empty"] &
+    ~df["is_too_short"] &
+    ~df["is_symbol_only"] &
+    ~df["is_duplicate"]
+)
+
+# Configurable conditions
+if CFG["drop_non_english"]:
+    hard_mask &= ~df["is_non_english"]
+
+if CFG["drop_zero_playtime"]:
+    hard_mask &= ~df["is_zero_playtime"]
+
+if CFG["drop_outlier_length"]:
+    hard_mask &= ~df["is_outlier_len"]
+
+df_model = (
+    df.loc[hard_mask, [
+        "review_text_clean",
+        "voted_up",
+        "playtime_forever",
+        "char_len",
+        "word_count",
+        "lang",
+        "is_zero_playtime",
+        "is_outlier_len",
+    ]]
+    .rename(columns={"review_text_clean": "review_text"})
+    .reset_index(drop=True)
+)
+
+print(f"   Rows after filtering: {len(df_model):,}  (started with {rows_raw:,})")
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 7.  QA SUMMARY
+# ═════════════════════════════════════════════════════════════════════════════
+
+print("── 6 / 7  QA summary ────────────────────────────────────────────────")
+
+qa_summary = pd.DataFrame([
+    ("rows_raw",             rows_raw),
+    ("rows_empty",           int(df["is_empty"].sum())),
+    ("rows_too_short",       int(df["is_too_short"].sum())),
+    ("rows_symbol_only",     int(df["is_symbol_only"].sum())),
+    ("rows_non_english",     int(df["is_non_english"].sum())),
+    ("rows_zero_playtime",   int(df["is_zero_playtime"].sum())),
+    ("rows_outlier_length",  int(df["is_outlier_len"].sum())),
+    ("rows_duplicate",       int(df["is_duplicate"].sum())),
+    ("rows_after_filters",   len(df_model)),
+    ("retention_pct",        round(len(df_model) / rows_raw * 100, 1)),
+], columns=["metric", "value"])
+
+print(qa_summary.to_string(index=False))
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 8.  DIAGNOSTIC PLOTS
+# ═════════════════════════════════════════════════════════════════════════════
+
+print("── 7 / 7  Generating plots ──────────────────────────────────────────")
+
+fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+fig.suptitle("RE4 Reviews — Post-cleaning QA", fontsize=14, fontweight="bold")
+
+# 8a. Character-length distribution
+sns.histplot(df_model["char_len"], bins=50, ax=axes[0, 0], color="#4C72B0")
+axes[0, 0].set_title("Review length distribution (chars)")
+axes[0, 0].set_xlabel("char_len")
+axes[0, 0].set_ylabel("count")
+axes[0, 0].axvline(CFG["max_char_len"], color="red", linestyle="--",
+                   label=f"outlier threshold ({CFG['max_char_len']})")
+axes[0, 0].legend(fontsize=8)
+
+# 8b. Word-count distribution
+sns.histplot(df_model["word_count"], bins=50, ax=axes[0, 1], color="#55A868")
+axes[0, 1].set_title("Word count distribution")
+axes[0, 1].set_xlabel("word_count")
+axes[0, 1].set_ylabel("count")
+
+# 8c. char_len by vote
+df_model["voted_up_str"] = df_model["voted_up"].map({True: "Positive", False: "Negative"})
+sns.boxplot(x="voted_up_str", y="char_len", data=df_model,
+            palette={"Positive": "#4C72B0", "Negative": "#C44E52"},
+            order=["Positive", "Negative"], ax=axes[1, 0])
+axes[1, 0].set_title("Review length by Steam vote")
+axes[1, 0].set_xlabel("voted_up")
+axes[1, 0].set_ylabel("char_len")
+
+# 8d. QA drop-off waterfall (bar chart)
+waterfall_data = qa_summary[qa_summary["metric"] != "retention_pct"].copy()
+waterfall_data = waterfall_data[waterfall_data["metric"] != "rows_after_filters"]
+drop_labels = waterfall_data["metric"].str.replace("rows_", "", regex=False)
+drop_values = waterfall_data["value"].values
+
+colors = ["#4C72B0"] + ["#C44E52"] * (len(drop_labels) - 1)
+axes[1, 1].bar(drop_labels, drop_values, color=colors)
+axes[1, 1].set_title("Row counts: raw vs each flag")
+axes[1, 1].set_xticklabels(drop_labels, rotation=35, ha="right", fontsize=8)
+axes[1, 1].set_ylabel("row count")
+
+plt.tight_layout()
+plt.savefig("re4_cleaning_qa.png", dpi=150)
+plt.show()
+print("   Plot saved → re4_cleaning_qa.png")
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 9.  SAVE
+# ═════════════════════════════════════════════════════════════════════════════
+
+df_model.to_csv(CFG["output_path"], index=False)
+print(f"\n✅  Clean dataset saved → '{CFG['output_path']}'")
+print(f"   Final shape: {df_model.shape[0]:,} rows × {df_model.shape[1]} columns")
+print(f"   Columns: {list(df_model.columns)}")
